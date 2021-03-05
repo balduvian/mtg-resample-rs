@@ -1,0 +1,27 @@
+[package]
+name = "mtg_resample_rs"
+version = "0.1.0"
+authors = ["gatcuddy <emmettglaser@gmail.com>"]
+edition = "2018"
+
+[dependencies.reqwest]
+version = "0.11.1"
+features = ["json", "serde_json", "stream"]
+
+[dependencies.serde]
+version = "1.0.123"
+features = ["derive"]
+
+[dependencies.tokio]
+version = "1.2.0"
+features = ["full"]
+
+[dependencies.image]
+version = "0.23.14"
+
+[dependencies.uuid]
+version = "0.8.2"
+
+[dependencies.bytes]
+version = "1.0.1"
+features = ["std"]
