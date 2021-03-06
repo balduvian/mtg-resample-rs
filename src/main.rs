@@ -1,20 +1,22 @@
 
 use reqwest::{Client};
 use serde::Deserialize;
-use image::{DynamicImage, GenericImageView, ImageFormat, EncodableLayout, GenericImage, RgbImage};
+use image::{DynamicImage, GenericImageView, ImageFormat, EncodableLayout, RgbImage};
 use image::imageops::{FilterType};
 use uuid::Uuid;
 use std::fs::create_dir;
 use std::path::Path;
 use std::convert::From;
 use std::{fs, env};
+use std::io::ErrorKind;
 
 const ASPECT: f32 = 4.0f32 / 3.0f32;
 const IMAGE_DIR: &str = "./cardImages/";
-const BASE_IMAGE_DIR: &str = "./test/asuka.png";
-const CARDS_WIDE: u32 = 32;
-const IMAGE_WIDTH: u32 = 1600;
-const SAMPLE_SIZE: u32 = 4;
+const BASE_IMAGE_DIR: &str = "./test/real scale.png";
+const CARDS_WIDE: u32 = 60;
+const IMAGE_WIDTH: u32 = 1800;
+const SAMPLE_SIZE: u32 = 6;
+const NORMAL_LAYOUT: &str = "normal";
 
 #[tokio::main]
 async fn main() {
@@ -26,7 +28,7 @@ async fn main() {
 
 	} else if args[1] == "pull" {
 		let mut card_images: Vec<DynamicImage> = Vec::new();
-		save_num_cards(IMAGE_DIR, &mut card_images, ASPECT, 9).await.unwrap();
+		save_num_cards(IMAGE_DIR, &mut card_images, ASPECT, 32).await.unwrap();
 
 	} else if args[1] == "resample" {
 		setup_dir(IMAGE_DIR).unwrap();
@@ -47,7 +49,9 @@ async fn main() {
 
 		println!("Found cards to sample!");
 
-		let output_image = draw_cards(&card_grid, &card_images, ASPECT, IMAGE_WIDTH);
+		let card_draw_images = create_draw_cards(&card_images, CARDS_WIDE, IMAGE_WIDTH, ASPECT);
+
+		let output_image = draw_cards(&card_grid, card_draw_images, ASPECT, IMAGE_WIDTH);
 
 		println!("Drew sampled image!");
 
@@ -66,6 +70,7 @@ struct ImageUris {
 #[derive(Deserialize)]
 struct CardInfo {
 	id: String,
+	layout: String,
 	image_uris: ImageUris
 }
 
@@ -89,12 +94,21 @@ fn load_existing_images(dir_path: &str, card_images: &mut Vec<DynamicImage>) {
 
 async fn save_num_cards(dir_path: &str, card_images: &mut Vec<DynamicImage>, card_aspect: f32, num_cards: u32) -> Result<(), Box<dyn std::error::Error>> {
 	let client = reqwest::Client::new();
+	let mut count = 0u32;
 
-	for _ in 0..num_cards {
-		let (card_image, card_uuid) = get_card(&client).await?;
-		save_card(card_image, card_uuid, card_aspect, dir_path, card_images);
+	while count < num_cards {
+		match get_card(&client).await {
+			Ok((card_image, card_uuid)) => {
+				save_card(card_image, card_uuid, card_aspect, dir_path, card_images);
 
-		println!("Got card {}!", card_uuid.to_string());
+				println!("Got card {} out of {}!", count + 1, num_cards);
+
+				count += 1;
+			},
+			Err(_err) => {
+				println!("Failed to get card!, retrying");
+			}
+		}
 	}
 
 	Ok(())
@@ -104,6 +118,9 @@ async fn get_card(client: &Client) -> Result<(DynamicImage, Uuid), Box<dyn std::
 	let response = client.get("https://api.scryfall.com/cards/random").send().await?;
 
 	let card_info = response.json::<CardInfo>().await?;
+
+	/* prevent tokens, double faced cards, other things that interfere with art */
+	if card_info.layout != NORMAL_LAYOUT { return Err(Box::new(std::io::Error::new(ErrorKind::Other, "Bad layout!"))) };
 
 	let response = client.get(&card_info.image_uris.art_crop).send().await?;
 
@@ -177,6 +194,22 @@ fn create_card_samples(card_images: &Vec<DynamicImage>, sample_size: u32) -> Vec
 		.collect::<Vec<RgbImage>>()
 }
 
+/**
+ * creates a list of card images to draw
+ * will be approximately 2 times the size that they will be drawn at
+ */
+fn create_draw_cards(card_images: &Vec<DynamicImage>, cards_wide: u32, image_width: u32, card_aspect: f32) -> Vec<RgbImage> {
+	let card_width = (image_width as f32 / cards_wide as f32) * 2f32;
+
+	let card_height = (card_width * (1f32 / card_aspect)).round() as u32;
+	let card_width = card_width.round() as u32;
+
+	card_images
+		.iter()
+		.map(|full_image| full_image.resize_exact(card_width, card_height, FilterType::CatmullRom).to_rgb8())
+		.collect::<Vec<RgbImage>>()
+}
+
 fn create_grid(cards_wide: u32, card_aspect: f32, image_width: u32, image_height: u32) -> CardGrid {
 	let card_width = image_width as f32 / cards_wide as f32;
 	let card_height = card_width * (1f32 / card_aspect);
@@ -193,29 +226,6 @@ fn create_sample_image(base_image: &DynamicImage, sample_size: u32, cards_wide: 
 }
 
 fn select_best_card(sample_image: &RgbImage, card_images: &Vec<RgbImage>, sample_size: u32, grid_x: u32, grid_y: u32) -> u32 {
-	fn bilinear(bytes: &[u8], width: u32, height: u32, x: f32, y: f32) -> [u8; 3] {
-		let pixel_x0 = x as u32;
-		let pixel_x1 = (pixel_x0 + 1u32).min(width - 1);
-		let weight_x1 = pixel_x0 as f32 - x;
-		let weight_x0 = 1f32 - weight_x1;
-
-		let pixel_y0 = y as u32;
-		let pixel_y1 = (pixel_y0 + 1u32).min(height - 1);
-		let weight_y1 = pixel_y0 as f32 - y;
-		let weight_y0 = 1f32 - weight_y1;
-
-		let channel_weight = |offset: u32| -> u8 {
-			(
-				(bytes[((pixel_y0 * width + pixel_x0) * 3u32 + offset) as usize] as f32 * weight_x0 * weight_y0) +
-				(bytes[((pixel_y1 * width + pixel_x0) * 3u32 + offset) as usize] as f32 * weight_x0 * weight_y1) +
-				(bytes[((pixel_y0 * width + pixel_x1) * 3u32 + offset) as usize] as f32 * weight_x1 * weight_y0) +
-				(bytes[((pixel_y1 * width + pixel_x1) * 3u32 + offset) as usize] as f32 * weight_x1 * weight_y1)
-			).round() as u8
-		};
-
-		[channel_weight(0), channel_weight(1), channel_weight(2)]
-	}
-
 	fn pixel_at(bytes: &[u8], width: u32, x: u32, y: u32) -> [u8; 3] {
 		[bytes[((width * y + x) * 3u32) as usize], bytes[((width * y + x) * 3u32 + 1) as usize], bytes[((width * y + x) * 3u32 + 2) as usize]]
 	}
@@ -255,13 +265,42 @@ fn select_best_card(sample_image: &RgbImage, card_images: &Vec<RgbImage>, sample
 	best_card
 }
 
-fn draw_cards(card_grid: &CardGrid, card_images: &Vec<DynamicImage>, card_aspect: f32, image_width: u32) -> DynamicImage {
+fn draw_cards(card_grid: &CardGrid, card_draw_images: Vec<RgbImage>, card_aspect: f32, image_width: u32) -> RgbImage {
+	fn bilinear(bytes: &[u8], width: u32, height: u32, x: f32, y: f32) -> [u8; 3] {
+		let pixel_x0 = x as u32;
+		let pixel_x1 = (pixel_x0 + 1u32).min(width - 1);
+		let weight_x1 = pixel_x0 as f32 - x;
+		let weight_x0 = 1f32 - weight_x1;
+
+		let pixel_y0 = y as u32;
+		let pixel_y1 = (pixel_y0 + 1u32).min(height - 1);
+		let weight_y1 = pixel_y0 as f32 - y;
+		let weight_y0 = 1f32 - weight_y1;
+
+		let channel_weight = |offset: u32| -> u8 {
+			(
+				(bytes[((pixel_y0 * width + pixel_x0) * 3u32 + offset) as usize] as f32 * weight_x0 * weight_y0) +
+				(bytes[((pixel_y1 * width + pixel_x0) * 3u32 + offset) as usize] as f32 * weight_x0 * weight_y1) +
+				(bytes[((pixel_y0 * width + pixel_x1) * 3u32 + offset) as usize] as f32 * weight_x1 * weight_y0) +
+				(bytes[((pixel_y1 * width + pixel_x1) * 3u32 + offset) as usize] as f32 * weight_x1 * weight_y1)
+			).round() as u8
+		};
+
+		[channel_weight(0), channel_weight(1), channel_weight(2)]
+	}
+
+	fn put_pixel(bytes: &mut [u8], pixel: &[u8;3], width: u32, x: u32, y: u32) {
+		bytes[((y * width + x) * 3    ) as usize] = pixel[0];
+		bytes[((y * width + x) * 3 + 1) as usize] = pixel[1];
+		bytes[((y * width + x) * 3 + 2) as usize] = pixel[2];
+	}
+
 	let card_width = image_width as f32 / card_grid.cards_wide as f32;
 	let card_height = (1f32 / card_aspect) * card_width;
 
 	let image_height = (card_height * card_grid.cards_tall as f32).round() as u32;
 
-	let mut draw_image = image::DynamicImage::new_rgb8(image_width, image_height);
+	let mut draw_bytes = vec![0u8; (image_width * image_height * 3) as usize];
 
 	for x in 0..card_grid.cards_wide {
 		let min_x = (x as f32 * card_width).round() as u32;
@@ -269,7 +308,8 @@ fn draw_cards(card_grid: &CardGrid, card_images: &Vec<DynamicImage>, card_aspect
 		let x_len = max_x - min_x;
 
 		for y in 0..card_grid.cards_tall {
-			let card_image = &card_images[card_grid.grid[(y * card_grid.cards_wide + x) as usize] as usize];
+			let card_image = &card_draw_images[card_grid.grid[(y * card_grid.cards_wide + x) as usize] as usize];
+			let card_bytes = card_image.as_bytes();
 
 			let min_y = (y as f32 * card_height).round() as u32;
 			let max_y = ((y + 1u32) as f32 * card_height).round() as u32;
@@ -277,17 +317,18 @@ fn draw_cards(card_grid: &CardGrid, card_images: &Vec<DynamicImage>, card_aspect
 
 			for x_along in 0..x_len {
 				let draw_x = x_along + min_x;
-				let card_x = ((x_along as f32 / x_len as f32) * card_image.width() as f32) as u32;
+				let card_x = (x_along as f32 / x_len as f32) * card_image.width() as f32;
 
 				for y_along in 0..y_len {
 					let draw_y = y_along + min_y;
-					let card_y = ((y_along as f32 / y_len as f32) * card_image.height() as f32) as u32;
+					let card_y = (y_along as f32 / y_len as f32) * card_image.height() as f32;
 
-					draw_image.put_pixel(draw_x, draw_y, card_image.get_pixel(card_x, card_y));
+					let pixel = bilinear(card_bytes, card_image.width(), card_image.height(), card_x, card_y);
+					put_pixel(&mut draw_bytes, &pixel, image_width, draw_x, draw_y);
 				}
 			}
 		}
 	}
 
-	draw_image
+	RgbImage::from_raw(image_width, image_height, draw_bytes).unwrap()
 }
