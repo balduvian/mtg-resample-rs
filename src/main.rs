@@ -12,10 +12,10 @@ use std::io::ErrorKind;
 
 const ASPECT: f32 = 4.0f32 / 3.0f32;
 const IMAGE_DIR: &str = "./cardImages/";
-const BASE_IMAGE_DIR: &str = "./test/real scale.png";
-const CARDS_WIDE: u32 = 60;
-const IMAGE_WIDTH: u32 = 1800;
-const SAMPLE_SIZE: u32 = 6;
+const BASE_IMAGE_DIR: &str = "./test/rosa head crop.png";
+const CARDS_WIDE: u32 = 30;
+const IMAGE_WIDTH: u32 = 2000;
+const SAMPLE_SIZE: u32 = 4;
 const NORMAL_LAYOUT: &str = "normal";
 
 #[tokio::main]
@@ -28,7 +28,7 @@ async fn main() {
 
 	} else if args[1] == "pull" {
 		let mut card_images: Vec<DynamicImage> = Vec::new();
-		save_num_cards(IMAGE_DIR, &mut card_images, ASPECT, 32).await.unwrap();
+		save_num_cards(IMAGE_DIR, &mut card_images, ASPECT, 100).await.unwrap();
 
 	} else if args[1] == "resample" {
 		setup_dir(IMAGE_DIR).unwrap();
@@ -36,6 +36,8 @@ async fn main() {
 		let mut card_images: Vec<DynamicImage> = Vec::with_capacity(32);
 
 		load_existing_images(IMAGE_DIR, &mut card_images);
+
+		let mut used_cards = vec![false; card_images.len()];
 
 		println!("Loaded {} images!", card_images.len());
 
@@ -45,13 +47,13 @@ async fn main() {
 
 		let mut card_grid = create_grid(CARDS_WIDE, ASPECT, base_image.width(), base_image.height());
 
-		populate_grid(&base_image, &card_images, &mut card_grid, SAMPLE_SIZE);
+		populate_grid(&base_image, &card_images, &mut used_cards, &mut card_grid, SAMPLE_SIZE);
 
 		println!("Found cards to sample!");
 
-		let card_draw_images = create_draw_cards(&card_images, CARDS_WIDE, IMAGE_WIDTH, ASPECT);
+		let (card_draw_images, card_draw_indices) = create_draw_cards(&card_images, &used_cards, CARDS_WIDE, IMAGE_WIDTH, ASPECT);
 
-		let output_image = draw_cards(&card_grid, card_draw_images, ASPECT, IMAGE_WIDTH);
+		let output_image = draw_cards(&card_grid, card_draw_images, card_draw_indices, ASPECT, IMAGE_WIDTH);
 
 		println!("Drew sampled image!");
 
@@ -176,13 +178,15 @@ struct CardGrid {
 	cards_tall: u32
 }
 
-fn populate_grid(base_image: &DynamicImage, card_images: &Vec<DynamicImage>, card_grid: &mut CardGrid, sample_size: u32) {
+fn populate_grid(base_image: &DynamicImage, card_images: &Vec<DynamicImage>, used_cards: &mut Vec<bool>, card_grid: &mut CardGrid, sample_size: u32) {
 	let card_samples = create_card_samples(card_images, sample_size);
 	let sample_image = create_sample_image(base_image, sample_size, card_grid.cards_wide, card_grid.cards_tall);
 
 	for x in 0..card_grid.cards_wide {
 		for y in 0..card_grid.cards_tall {
-			card_grid.grid[(y * card_grid.cards_wide + x) as usize] = select_best_card(&sample_image, &card_samples, sample_size, x, y);
+			let selected_card = select_best_card(&sample_image, &card_samples, sample_size, x, y);
+			card_grid.grid[(y * card_grid.cards_wide + x) as usize] = selected_card;
+			used_cards[selected_card as usize] = true;
 		}
 	}
 }
@@ -198,16 +202,30 @@ fn create_card_samples(card_images: &Vec<DynamicImage>, sample_size: u32) -> Vec
  * creates a list of card images to draw
  * will be approximately 2 times the size that they will be drawn at
  */
-fn create_draw_cards(card_images: &Vec<DynamicImage>, cards_wide: u32, image_width: u32, card_aspect: f32) -> Vec<RgbImage> {
+fn create_draw_cards(card_images: &Vec<DynamicImage>, used_cards: &Vec<bool>, cards_wide: u32, image_width: u32, card_aspect: f32) -> (Vec<RgbImage>, Vec<usize>) {
 	let card_width = (image_width as f32 / cards_wide as f32) * 2f32;
 
 	let card_height = (card_width * (1f32 / card_aspect)).round() as u32;
 	let card_width = card_width.round() as u32;
 
-	card_images
-		.iter()
-		.map(|full_image| full_image.resize_exact(card_width, card_height, FilterType::CatmullRom).to_rgb8())
-		.collect::<Vec<RgbImage>>()
+	let mut resized_card_indices = vec![0usize; card_images.len()];
+	let mut resized_index = 0usize;
+
+	let resized_cards = card_images
+		.iter().enumerate()
+		.filter_map(|(full_index, full_image)| if used_cards[full_index] {
+			let resized_image = full_image.resize_exact(card_width, card_height, FilterType::CatmullRom).to_rgb8();
+
+			resized_card_indices[full_index] = resized_index;
+			resized_index += 1;
+
+			Some(resized_image)
+		} else {
+			None
+		})
+		.collect::<Vec<RgbImage>>();
+
+	(resized_cards, resized_card_indices)
 }
 
 fn create_grid(cards_wide: u32, card_aspect: f32, image_width: u32, image_height: u32) -> CardGrid {
@@ -265,7 +283,7 @@ fn select_best_card(sample_image: &RgbImage, card_images: &Vec<RgbImage>, sample
 	best_card
 }
 
-fn draw_cards(card_grid: &CardGrid, card_draw_images: Vec<RgbImage>, card_aspect: f32, image_width: u32) -> RgbImage {
+fn draw_cards(card_grid: &CardGrid, card_draw_images: Vec<RgbImage>, card_draw_indices: Vec<usize>, card_aspect: f32, image_width: u32) -> RgbImage {
 	fn bilinear(bytes: &[u8], width: u32, height: u32, x: f32, y: f32) -> [u8; 3] {
 		let pixel_x0 = x as u32;
 		let pixel_x1 = (pixel_x0 + 1u32).min(width - 1);
@@ -308,7 +326,7 @@ fn draw_cards(card_grid: &CardGrid, card_draw_images: Vec<RgbImage>, card_aspect
 		let x_len = max_x - min_x;
 
 		for y in 0..card_grid.cards_tall {
-			let card_image = &card_draw_images[card_grid.grid[(y * card_grid.cards_wide + x) as usize] as usize];
+			let card_image = &card_draw_images[card_draw_indices[card_grid.grid[(y * card_grid.cards_wide + x) as usize] as usize]];
 			let card_bytes = card_image.as_bytes();
 
 			let min_y = (y as f32 * card_height).round() as u32;
