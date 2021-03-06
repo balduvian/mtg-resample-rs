@@ -1,7 +1,7 @@
 
 use reqwest::{Client};
 use serde::Deserialize;
-use image::{DynamicImage, GenericImageView, ImageFormat, Rgba, EncodableLayout, load_from_memory, GenericImage, Rgb, RgbImage};
+use image::{DynamicImage, GenericImageView, ImageFormat, EncodableLayout, GenericImage, RgbImage};
 use image::imageops::{FilterType};
 use uuid::Uuid;
 use std::fs::create_dir;
@@ -11,7 +11,10 @@ use std::{fs, env};
 
 const ASPECT: f32 = 4.0f32 / 3.0f32;
 const IMAGE_DIR: &str = "./cardImages/";
-const BASE_IMAGE_DIR: &str = "./test/rosa head crop.png";
+const BASE_IMAGE_DIR: &str = "./test/asuka.png";
+const CARDS_WIDE: u32 = 32;
+const IMAGE_WIDTH: u32 = 1600;
+const SAMPLE_SIZE: u32 = 4;
 
 #[tokio::main]
 async fn main() {
@@ -34,17 +37,17 @@ async fn main() {
 
 		println!("Loaded {} images!", card_images.len());
 
-		let base_image = image::load_from_memory(fs::read(BASE_IMAGE_DIR).unwrap().as_slice()).unwrap().to_rgb8();
+		let base_image = image::load_from_memory(fs::read(BASE_IMAGE_DIR).unwrap().as_slice()).unwrap();
 
 		println!("Loaded base image!");
 
-		let mut card_grid = create_grid(72, ASPECT, base_image.width(), base_image.height());
+		let mut card_grid = create_grid(CARDS_WIDE, ASPECT, base_image.width(), base_image.height());
 
-		populate_grid(&base_image, &card_images, &mut card_grid, ASPECT);
+		populate_grid(&base_image, &card_images, &mut card_grid, SAMPLE_SIZE);
 
 		println!("Found cards to sample!");
 
-		let output_image = draw_cards(&card_grid, &card_images, ASPECT, 1800);
+		let output_image = draw_cards(&card_grid, &card_images, ASPECT, IMAGE_WIDTH);
 
 		println!("Drew sampled image!");
 
@@ -156,23 +159,21 @@ struct CardGrid {
 	cards_tall: u32
 }
 
-fn populate_grid(base_image: &RgbImage, card_images: &Vec<DynamicImage>, card_grid: &mut CardGrid, card_aspect: f32) {
-	let card_samples = create_card_samples(card_images, card_aspect, base_image.width(), card_grid.cards_wide);
+fn populate_grid(base_image: &DynamicImage, card_images: &Vec<DynamicImage>, card_grid: &mut CardGrid, sample_size: u32) {
+	let card_samples = create_card_samples(card_images, sample_size);
+	let sample_image = create_sample_image(base_image, sample_size, card_grid.cards_wide, card_grid.cards_tall);
 
 	for x in 0..card_grid.cards_wide {
 		for y in 0..card_grid.cards_tall {
-			card_grid.grid[(y * card_grid.cards_wide + x) as usize] = select_best_card(&base_image, &card_samples, &card_grid, x, y);
+			card_grid.grid[(y * card_grid.cards_wide + x) as usize] = select_best_card(&sample_image, &card_samples, sample_size, x, y);
 		}
 	}
 }
 
-fn create_card_samples(card_images: &Vec<DynamicImage>, card_aspect: f32, image_width: u32, cards_wide: u32) -> Vec<RgbImage> {
-	let sample_width = (image_width as f32 / cards_wide as f32).round() as u32;
-	let sample_height = ((1f32 / card_aspect) * sample_width as f32).round() as u32;
-
+fn create_card_samples(card_images: &Vec<DynamicImage>, sample_size: u32) -> Vec<RgbImage> {
 	card_images
 		.iter()
-		.map(|full_image| full_image.resize_exact(sample_width, sample_height, FilterType::CatmullRom).to_rgb8())
+		.map(|full_image| full_image.resize_exact(sample_size, sample_size, FilterType::CatmullRom).to_rgb8())
 		.collect::<Vec<RgbImage>>()
 }
 
@@ -187,21 +188,11 @@ fn create_grid(cards_wide: u32, card_aspect: f32, image_width: u32, image_height
 	CardGrid { grid, cards_wide, cards_tall }
 }
 
-fn select_best_card(base_image: &RgbImage, card_images: &Vec<RgbImage>, card_grid: &CardGrid, x: u32, y: u32) -> u32 {
-	let region_width = base_image.width() as f32 / card_grid.cards_wide as f32;
-	let region_height = base_image.height() as f32 / card_grid.cards_tall as f32;
+fn create_sample_image(base_image: &DynamicImage, sample_size: u32, cards_wide: u32, cards_tall: u32) -> RgbImage {
+	base_image.resize_exact(cards_wide * sample_size, cards_tall * sample_size, FilterType::CatmullRom).to_rgb8()
+}
 
-	let region_x = region_width * x as f32;
-	let region_y = region_height * y as f32;
-
-	let min_x = region_x.round() as u32;
-	let max_x = ((region_x + region_width).round() as u32).min(base_image.width() - 1);
-	let len_x = max_x - min_x + 1;
-
-	let min_y = region_y.round() as u32;
-	let max_y = ((region_y + region_height).round() as u32).min(base_image.height() - 1);
-	let len_y = max_y - min_y + 1;
-
+fn select_best_card(sample_image: &RgbImage, card_images: &Vec<RgbImage>, sample_size: u32, grid_x: u32, grid_y: u32) -> u32 {
 	fn bilinear(bytes: &[u8], width: u32, height: u32, x: f32, y: f32) -> [u8; 3] {
 		let pixel_x0 = x as u32;
 		let pixel_x1 = (pixel_x0 + 1u32).min(width - 1);
@@ -225,11 +216,11 @@ fn select_best_card(base_image: &RgbImage, card_images: &Vec<RgbImage>, card_gri
 		[channel_weight(0), channel_weight(1), channel_weight(2)]
 	}
 
-	fn direct(bytes: &[u8], width: u32, x: u32, y: u32) -> [u8; 3] {
+	fn pixel_at(bytes: &[u8], width: u32, x: u32, y: u32) -> [u8; 3] {
 		[bytes[((width * y + x) * 3u32) as usize], bytes[((width * y + x) * 3u32 + 1) as usize], bytes[((width * y + x) * 3u32 + 2) as usize]]
 	}
 
-	fn pixel_compare(pixel0: [u8; 3], pixel1: [u8; 3]) -> u32 {
+	fn pixel_difference(pixel0: [u8; 3], pixel1: [u8; 3]) -> u32 {
 		(pixel0[0] as i16 - pixel1[0] as i16).abs() as u32 +
 		(pixel0[1] as i16 - pixel1[1] as i16).abs() as u32 +
 		(pixel0[2] as i16 - pixel1[2] as i16).abs() as u32
@@ -242,17 +233,15 @@ fn select_best_card(base_image: &RgbImage, card_images: &Vec<RgbImage>, card_gri
 		let mut current_dif = 0u32;
 
 		/* all pixels sampled from the card image */
-		for x in 0..len_x {
-			let base_x = x + min_x;
-			let card_x = (x as f32 / len_x as f32) * card_image.width() as f32;
+		for sample_x in 0..sample_size {
+			let base_x = grid_x * sample_size + sample_x;
 
-			for y in 0..len_y {
-				let base_y = y + min_y;
-				let card_y = (y as f32 / len_y as f32) * card_image.height() as f32;
+			for sample_y in 0..sample_size {
+				let base_y = grid_y * sample_size + sample_y;
 
-				current_dif += pixel_compare(
-					direct(base_image.as_bytes(), base_image.width(), base_x, base_y),
-					bilinear(card_image.as_bytes(), card_image.width(), card_image.height(), card_x, card_y)
+				current_dif += pixel_difference(
+					pixel_at(sample_image.as_bytes(), sample_image.width(), base_x, base_y),
+					pixel_at(card_image.as_bytes(), sample_size, sample_x, sample_y)
 				);
 			}
 		}
