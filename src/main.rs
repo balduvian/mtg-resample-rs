@@ -1,3 +1,4 @@
+mod new_sample;
 
 use reqwest::{Client};
 use serde::Deserialize;
@@ -9,13 +10,15 @@ use std::path::Path;
 use std::convert::From;
 use std::{fs, env};
 use std::io::ErrorKind;
+use std::ptr::null;
+use crate::new_sample::{populate_grid_new, rank_all_cards};
 
-const ASPECT: f32 = 4.0f32 / 3.0f32;
-const IMAGE_DIR: &str = "./cardImages/";
-const BASE_IMAGE_DIR: &str = "./test/rosa head crop.png";
-const CARDS_WIDE: u32 = 30;
+const ASPECT: f32 = 16.0_f32 / 9.0_f32;
+const IMAGE_DIR: &str = "./ankiImages/";
+const BASE_IMAGE_DIR: &str = "./test/nancy-crop.jpg";
+const CARDS_WIDE: u32 = 80;
 const IMAGE_WIDTH: u32 = 2000;
-const SAMPLE_SIZE: u32 = 4;
+const SAMPLE_SIZE: u32 = 9;
 const NORMAL_LAYOUT: &str = "normal";
 
 #[tokio::main]
@@ -58,6 +61,28 @@ async fn main() {
 		println!("Drew sampled image!");
 
 		output_image.save_with_format("./test/sampled.png", ImageFormat::Png).unwrap();
+
+	} else if args[1] == "new" {
+		setup_dir(IMAGE_DIR).unwrap();
+		let mut card_images: Vec<DynamicImage> = Vec::with_capacity(32);
+
+		load_existing_images(IMAGE_DIR, &mut card_images);
+		println!("Loaded {} images!", card_images.len());
+
+		let base_image = image::load_from_memory(fs::read(BASE_IMAGE_DIR).unwrap().as_slice()).unwrap();
+		println!("Loaded base image!");
+
+		let mut card_grid = create_grid_fitting(card_images.len() as u32, ASPECT, base_image.width(), base_image.height());
+		populate_grid_new(&base_image, &card_images, &mut card_grid, SAMPLE_SIZE);
+		println!("Found cards to sample!");
+
+		let all_used_cards = card_images.iter().map(|_| true).collect::<Vec<bool>>();
+		let (card_draw_images, card_draw_indices) = create_draw_cards(&card_images, &all_used_cards, card_grid.cards_wide, IMAGE_WIDTH, ASPECT);
+		let output_image = draw_cards(&card_grid, card_draw_images, card_draw_indices, ASPECT, IMAGE_WIDTH);
+		println!("Drew sampled image!");
+
+		output_image.save_with_format("./test/sampled.png", ImageFormat::Png).unwrap();
+		println!("Saved sampled image!");
 
 	} else {
 		println!("Invalid argument");
@@ -150,7 +175,6 @@ fn save_card(card_image: DynamicImage, card_uuid: Uuid, card_aspect: f32, dir_pa
 	card_images.push(cropped_image);
 }
 
-
 fn crop_card(card_image: DynamicImage, desired_aspect: f32) -> DynamicImage {
 	let width = card_image.width();
 	let height = card_image.height();
@@ -172,7 +196,7 @@ fn crop_card(card_image: DynamicImage, desired_aspect: f32) -> DynamicImage {
 	card_image.resize_to_fill(new_width, new_height, FilterType::Triangle)
 }
 
-struct CardGrid {
+pub struct CardGrid {
 	grid: Vec<u32>,
 	cards_wide: u32,
 	cards_tall: u32
@@ -214,7 +238,7 @@ fn create_draw_cards(card_images: &Vec<DynamicImage>, used_cards: &Vec<bool>, ca
 	let resized_cards = card_images
 		.iter().enumerate()
 		.filter_map(|(full_index, full_image)| if used_cards[full_index] {
-			let resized_image = full_image.resize_exact(card_width, card_height, FilterType::CatmullRom).to_rgb8();
+			let resized_image = full_image.resize_exact(card_width, card_height, FilterType::Triangle).to_rgb8();
 
 			resized_card_indices[full_index] = resized_index;
 			resized_index += 1;
@@ -228,19 +252,74 @@ fn create_draw_cards(card_images: &Vec<DynamicImage>, used_cards: &Vec<bool>, ca
 	(resized_cards, resized_card_indices)
 }
 
-fn create_grid(cards_wide: u32, card_aspect: f32, image_width: u32, image_height: u32) -> CardGrid {
+fn cards_tall(cards_wide: u32, card_aspect: f32, image_width: u32, image_height: u32) -> u32 {
 	let card_width = image_width as f32 / cards_wide as f32;
-	let card_height = card_width * (1f32 / card_aspect);
+	let card_height = card_width * (1_f32 / card_aspect);
 
-	let cards_tall = (image_height as f32 / card_height).round() as u32;
+	/* cards tall = */
+	(image_height as f32 / card_height).round() as u32
+}
+
+fn cards_wide(cards_tall: u32, card_aspect: f32, image_width: u32, image_height: u32) -> u32 {
+	let card_height = image_height as f32 / cards_tall as f32;
+	let card_width = card_height * card_aspect;
+
+	/* cards tall = */
+	(image_width as f32 / card_width).round() as u32
+}
+
+fn create_grid(cards_wide: u32, card_aspect: f32, image_width: u32, image_height: u32) -> CardGrid {
+	let cards_tall = cards_tall(cards_wide, card_aspect, image_width, image_height);
 
 	let grid = vec![0u32; (cards_wide * cards_tall) as usize];
-
 	CardGrid { grid, cards_wide, cards_tall }
 }
 
+fn create_grid_fitting(n: u32, card_aspect: f32, image_width: u32, image_height: u32) -> CardGrid {
+	let mut increment = 1;
+
+	let mut result_wide;
+	let mut result_tall;
+
+	struct Result {
+		width: u32,
+		height: u32,
+	}
+	impl Result {
+		fn size(&self) -> u32 {
+			self.width * self.height
+		}
+	}
+
+	loop {
+		let results = [
+			Result { width: cards_wide(increment, card_aspect, image_width, image_height), height: increment },
+			Result { width: increment, height: cards_tall(increment, card_aspect, image_width, image_height) },
+		];
+
+		let best_result = results.iter()
+			.filter(|result| result.size() >= n)
+			.min_by(|result0, result1| result0.size().partial_cmp(&result1.size()).unwrap());
+
+		if best_result.is_some() {
+			let best = best_result.unwrap();
+			result_wide = best.width;
+			result_tall = best.height;
+			break;
+		}
+
+		increment += 1;
+	}
+
+	CardGrid {
+		grid: vec![0u32; (result_wide * result_tall) as usize],
+		cards_wide: result_wide,
+		cards_tall: result_tall
+	}
+}
+
 fn create_sample_image(base_image: &DynamicImage, sample_size: u32, cards_wide: u32, cards_tall: u32) -> RgbImage {
-	base_image.resize_exact(cards_wide * sample_size, cards_tall * sample_size, FilterType::CatmullRom).to_rgb8()
+	base_image.resize_exact(cards_wide * sample_size, cards_tall * sample_size, FilterType::Triangle).to_rgb8()
 }
 
 fn select_best_card(sample_image: &RgbImage, card_images: &Vec<RgbImage>, sample_size: u32, grid_x: u32, grid_y: u32) -> u32 {
