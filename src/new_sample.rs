@@ -1,7 +1,8 @@
-use image::{DynamicImage, RgbImage, EncodableLayout};
+use image::{DynamicImage, RgbImage, EncodableLayout, ImageFormat};
 use crate::{CardGrid, create_card_samples, create_sample_image, get_card};
+use crate::preprocess::{add_duplicates, count_brightness, create_brightness_counts, create_brightness_map, match_brightness};
 
-fn pixel_at(bytes: &[u8], width: u32, x: u32, y: u32) -> (u8, u8, u8) {
+pub fn pixel_at(bytes: &[u8], width: u32, x: u32, y: u32) -> (u8, u8, u8) {
 	(
 		bytes[((width * y + x) * 3) as usize],
 		bytes[((width * y + x) * 3 + 1) as usize],
@@ -42,12 +43,29 @@ pub fn populate_grid_new(
 	base_image: &DynamicImage,
 	card_images: &Vec<DynamicImage>,
 	card_grid: &mut CardGrid,
-	sample_size: u32
+	sample_size: u32,
 ) {
+	println!("Creating sample image...");
 	let sample_image = create_sample_image(base_image, sample_size, card_grid.cards_wide, card_grid.cards_tall);
-	let sample_cards = create_card_samples(card_images, sample_size);
+	println!("Creating sample cards...");
+	let mut sample_cards = create_card_samples(card_images, sample_size);
 
-	let (optimal_cards, mut columns) = rank_all_cards(
+	println!("brightness preprocessing...");
+	let mut base_brightness_counts = create_brightness_counts();
+	let mut card_brightness_counts = create_brightness_counts();
+
+	count_brightness(&sample_image, &mut base_brightness_counts);
+	for card in &sample_cards {
+		count_brightness(card, &mut card_brightness_counts);
+	}
+
+	let brightness_map = create_brightness_map(&base_brightness_counts, &card_brightness_counts);
+	let sample_image = match_brightness(&sample_image, &brightness_map);
+
+	sample_image.save_with_format("./test/brightness-matched.png", ImageFormat::Png).unwrap();
+
+	println!("Ranking cards...");
+	let mut columns = rank_all_cards(
 		&sample_image,
 		&sample_cards,
 		card_grid.cards_wide,
@@ -55,14 +73,17 @@ pub fn populate_grid_new(
 		sample_size,
 	);
 
-	let mut select_grid = create_select_grid(card_grid.cards_wide, card_grid.cards_tall);
+	//println!("Determining visit order...");
+	//let visit_order = create_visit_order(card_grid.cards_wide, card_grid.cards_tall);
 
-	rank_selection(&mut select_grid, &mut columns);
-	fill_in_rest(&mut select_grid, &optimal_cards);
+	//println!("determining detail...");
+	//let detail_order = create_detail_order(&sample_image, card_grid.cards_wide, card_grid.cards_tall, sample_size);
 
-	for i in 0..card_grid.grid.len() {
-		card_grid.grid[i] = select_grid[i] as u32;
-	}
+	println!("determining best fit...");
+	let best_fit_order = create_best_fit_order(&columns);
+
+	println!("Selecting cards...");
+	rank_selection(&mut card_grid.grid, &mut columns, &best_fit_order);
 }
 
 /**
@@ -74,8 +95,8 @@ pub fn rank_all_cards(
 	cards_wide: u32,
 	cards_tall: u32,
 	sample_size: u32,
-) -> (Vec<u32>, Vec<Vec<ColumnEntry>>) {
-	let columns = ranks_to_columns(
+) -> Vec<Vec<ColumnEntry>> {
+	ranks_to_columns(
 		sample_cards.iter().map(|sample_card| rank_card(
 			sample_image,
 			&sample_card,
@@ -85,13 +106,7 @@ pub fn rank_all_cards(
 		)).collect::<Vec<Vec<u32>>>(),
 		cards_wide,
 		cards_tall
-	);
-
-	let optimal_cards = (0..cards_wide * cards_tall)
-		.map(|spot| columns[spot as usize].last().unwrap().id)
-		.collect::<Vec<u32>>();
-
-	(optimal_cards, columns)
+	)
 }
 
 pub fn added_focus_cost(
@@ -139,6 +154,74 @@ pub fn rank_card(
 	ranks
 }
 
+
+pub fn create_detail_order(
+	sample_image: &RgbImage,
+	cards_wide: u32,
+	cards_tall: u32,
+	sample_size: u32,
+) -> Vec<usize> {
+	let base_bytes = sample_image.as_bytes();
+
+	let mut sort_list = Vec::with_capacity((cards_wide * cards_tall) as usize);
+
+	for spot in 0..(cards_wide * cards_tall) {
+		let x = spot % cards_wide;
+		let y = spot / cards_wide;
+		let mut running_difference = 0;
+
+		/* horizontal running difference */
+		for j in y * sample_size..(y + 1) * sample_size {
+			let mut last_pixel = pixel_at(base_bytes, sample_image.width(), x * sample_size, j);
+
+			for i in x * sample_size + 1..(x + 1) * sample_size {
+				let this_pixel = pixel_at(base_bytes, sample_image.width(), i, j);
+				running_difference += pixel_difference(last_pixel, this_pixel);
+				last_pixel = this_pixel;
+			}
+		}
+
+		/* vertical running difference */
+		for i in x * sample_size..(x + 1) * sample_size {
+			let mut last_pixel = pixel_at(base_bytes, sample_image.width(), i, y * sample_size);
+
+			for j in y * sample_size + 1..(y + 1) * sample_size {
+				let this_pixel = pixel_at(base_bytes, sample_image.width(), i, j);
+				running_difference += pixel_difference(last_pixel, this_pixel);
+				last_pixel = this_pixel;
+			}
+		}
+
+		match sort_list.binary_search_by(|item: &(u32, u32)| {
+			item.1.cmp(&running_difference).reverse()
+		}) {
+			Ok(pos) => sort_list.insert(pos, (spot, running_difference)),
+			Err(pos) => sort_list.insert(pos, (spot, running_difference)),
+		}
+	}
+
+	sort_list.iter().map(|item| item.0 as usize).collect::<Vec<usize>>()
+}
+
+fn create_best_fit_order(
+	columns: &Vec<Vec<ColumnEntry>>
+) -> Vec<usize> {
+	let mut sort_list = Vec::with_capacity(columns.len());
+
+	for spot in 0..columns.len() {
+		let best = columns[spot].last().unwrap();
+
+		match sort_list.binary_search_by(|item: &(usize, u32)| {
+			item.1.cmp(&best.difference)
+		}) {
+			Ok(pos) => sort_list.insert(pos, (spot, best.difference)),
+			Err(pos) => sort_list.insert(pos, (spot, best.difference)),
+		}
+	}
+
+	sort_list.iter().map(|item| item.0 as usize).collect::<Vec<usize>>()
+}
+
 pub struct ColumnEntry {
 	difference: u32,
 	id: u32,
@@ -177,50 +260,152 @@ pub fn create_select_grid(
 
 /* two step filler for the select grid */
 
+pub fn distance_from_center_squared(
+	x: u32,
+	y: u32,
+	cards_wide: u32,
+	cards_tall: u32,
+) -> f32 {
+	((x as f32 + 0.5_f32) - (cards_wide as f32 / 2.0_f32)).powi(2) +
+	((y as f32 + 0.5_f32) - (cards_tall as f32 / 2.0_f32)).powi(2)
+}
+
+fn create_visit_order(
+	cards_wide: u32,
+	cards_tall: u32,
+) -> Vec<usize> {
+	let distance_board = (0..cards_wide * cards_tall)
+		.map(|spot| distance_from_center_squared(
+			spot % cards_wide,
+			spot / cards_wide,
+			cards_wide,
+			cards_tall,
+		)).collect::<Vec<f32>>();
+
+	let mut gotten_board = vec![false; (cards_wide * cards_tall) as usize];
+
+	let mut order = Vec::with_capacity((cards_wide * cards_tall) as usize);
+
+	let largest_circle =
+		((cards_wide as f32 / 2.0_f32).powi(2) + (cards_tall as f32 / 2.0_f32).powi(2))
+		.sqrt().ceil() as u32;
+
+	/* circle rounds! */
+	for radius in 1..=largest_circle {
+		let radius = radius as f32;
+		let inner_radius = radius * 2.0_f32.sqrt() / 2.0_f32;
+		let radius_squared = radius.powi(2);
+
+		let center_x = cards_wide as f32 / 2.0_f32;
+		let center_y = cards_tall as f32 / 2.0_f32;
+
+		/*
+		 * #   #
+		 *  # #
+		 *  # #
+		 * #   #
+		 */
+
+		let right_bound = cards_wide as i32 - 1;
+		let down_bound = cards_tall as i32 - 1;
+
+		let outer_left = ((center_x - radius).floor() as i32).max(0) as u32;
+		let outer_right = ((center_x + radius).ceil() as i32).min(right_bound) as u32;
+		let inner_left = ((center_x - inner_radius + 1_f32).ceil() as i32).max(0) as u32;
+		let inner_right = ((center_x + inner_radius - 1_f32).floor() as i32).min(right_bound) as u32;
+
+		let outer_up = ((center_y - radius).floor() as i32).max(0) as u32;
+		let outer_down = ((center_y + radius).ceil() as i32).min(down_bound) as u32;
+		let inner_up = ((center_y - inner_radius + 1_f32).ceil() as i32).max(0) as u32;
+		let inner_down = ((center_y + inner_radius - 1_f32).floor() as i32).min(down_bound) as u32;
+
+		let mut try_space = |x: u32, y: u32| {
+			let spot = (y * cards_wide + x) as usize;
+			if !gotten_board[spot] {
+				if distance_board[spot] <= radius_squared {
+					/* potentially add randomness?? */
+					order.push(spot);
+					gotten_board[spot] = true;
+				}
+			}
+		};
+
+		for x in outer_left..=outer_right {
+			for y in outer_up..=inner_up {
+				try_space(x, y);
+			}
+			for y in inner_down..=outer_down {
+				try_space(x, y);
+			}
+		}
+		for y in inner_up..=inner_down {
+			for x in outer_left..=inner_left {
+				try_space(x, y);
+			}
+			for x in inner_right..=outer_right {
+				try_space(x, y);
+			}
+		}
+	}
+
+	order
+}
+
 /**
  * first, insert each card at least once
  */
 pub fn rank_selection(
-	select_grid: &mut Vec<i32>,
+	card_grid: &mut Vec<u32>,
 	columns: &mut Vec<Vec<ColumnEntry>>,
+	visit_order: &Vec<usize>,
 ) {
 	let num_cards = columns[0].len();
-	for _ in 0..num_cards {
-		/* find the column with the lowest, optimal, value */
-		let (best_index, best_column) = columns.iter()
-			.enumerate()
-			.filter(|(i, _)| select_grid[*i] == -1)
-			.min_by(|(_, column0), (_, column1)|
-				column0.last().unwrap()
-					.difference.partial_cmp(&column1.last().unwrap().difference).unwrap()
-			).unwrap();
+
+	/* place every unique card */
+	sub_rank_selection(
+		card_grid,
+		columns,
+		visit_order,
+		0,
+		num_cards.min(visit_order.len())
+	);
+
+	/* place remaining duplicates */
+	sub_rank_selection(
+		card_grid,
+		columns,
+		visit_order,
+		num_cards,
+		visit_order.len()
+	);
+}
+
+fn sub_rank_selection(
+	card_grid: &mut Vec<u32>,
+	columns: &mut Vec<Vec<ColumnEntry>>,
+	visit_order: &Vec<usize>,
+	start_index: usize,
+	end_index: usize,
+) {
+	for i in start_index..end_index {
+		let best_index = visit_order[i];
+		let best_column = &columns[best_index];
 
 		/* insert that card into that spot */
+		/* risky, must guarantee that the column has not run out */
 		let card_id = best_column.last().unwrap().id;
-		select_grid[best_index] = card_id as i32;
+		card_grid[best_index] = card_id;
 
-		/* delete all of that card's entries in the columns */
-		for spot in 0..select_grid.len() {
-			let mut column = &mut columns[spot as usize];
+		/* delete all of that card's entries in the future columns */
+		/* leave the overflow duplicate untouched */
+		for j in i + 1..end_index {
+			let remove_index = visit_order[j];
+			let column = &mut columns[remove_index];
 
 			let (remove_index, _) = column.iter()
 				.enumerate().rev().find(|(_, entry)| entry.id == card_id).unwrap();
 
 			column.remove(remove_index);
-		}
-	}
-}
-
-/**
- * then, for spots that weren't chosen yet, find the optimal card
- */
-pub fn fill_in_rest(
-	select_grid: &mut Vec<i32>,
-	optimal_cards: &Vec<u32>,
-) {
-	for spot in 0..select_grid.len() {
-		if select_grid[spot as usize] == -1 {
-			select_grid[spot as usize] = optimal_cards[spot as usize] as i32;
 		}
 	}
 }

@@ -25,3 +25,5 @@ version = "0.8.2"
 [dependencies.bytes]
 version = "1.0.1"
 features = ["std"]
+
+[dependencies.rand]
